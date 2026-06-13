@@ -22,8 +22,8 @@ VERSION=${GCMS_VERSION:-}
 START_AFTER_INSTALL=${GCMS_START:-1}
 ENABLE_CADDY=${ENABLE_CADDY:-${GCMS_ENABLE_CADDY:-0}}
 SITE_DOMAIN=${DOMAIN:-${GCMS_DOMAIN:-}}
-CADDYFILE=${GCMS_CADDYFILE:-/etc/caddy/Caddyfile}
-CADDY_CONF_DIR=${GCMS_CADDY_CONF_DIR:-/etc/caddy/conf.d}
+SETUP_CADDY_URL=${GCMS_SETUP_CADDY_URL:-https://raw.githubusercontent.com/$RELEASE_REPO/main/setup-caddy.sh}
+SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || pwd)
 
 if [ -t 1 ]; then
   C_OK='\033[32m'
@@ -199,7 +199,7 @@ caddy_enabled() {
   is_true "$ENABLE_CADDY"
 }
 
-prepare_caddy_env() {
+prepare_caddy_defaults() {
   goos=$1
   caddy_enabled || return 0
 
@@ -234,129 +234,31 @@ caddy_backend() {
   esac
 }
 
-install_caddy_apt() {
-  info "安装 Caddy（Debian/Ubuntu 官方 apt 源）"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
-  tmp_key="/tmp/caddy-stable-gpg.$$"
-  curl -1fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$tmp_key"
-  gpg --dearmor < "$tmp_key" > /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  rm -f "$tmp_key"
-  curl -1fsSL 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o /etc/apt/sources.list.d/caddy-stable.list
-  chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
-  apt-get update
-  apt-get install -y caddy
-}
-
-install_caddy_dnf() {
-  info "安装 Caddy（Fedora/RHEL/CentOS COPR）"
-  dnf -y install dnf5-plugins || dnf -y install dnf-plugins-core
-  dnf -y copr enable @caddy/caddy
-  dnf -y install caddy
-}
-
-install_caddy_pacman() {
-  info "安装 Caddy（Arch/Manjaro pacman）"
-  pacman -Sy --noconfirm caddy
-}
-
-install_caddy_if_needed() {
-  if command -v caddy >/dev/null 2>&1; then
-    ok "已检测到 Caddy：$(caddy version 2>/dev/null || printf 'installed')"
-    return 0
-  fi
-
-  if command -v apt-get >/dev/null 2>&1; then
-    install_caddy_apt
-  elif command -v dnf >/dev/null 2>&1; then
-    install_caddy_dnf
-  elif command -v pacman >/dev/null 2>&1; then
-    install_caddy_pacman
-  else
-    fail "未找到支持的包管理器。请先手动安装 Caddy，再重新执行 ENABLE_CADDY=1 DOMAIN=$SITE_DOMAIN。"
-  fi
-
-  command -v caddy >/dev/null 2>&1 || fail "Caddy 安装后仍不可用，请检查系统包管理器输出。"
-}
-
-ensure_caddy_import() {
-  caddyfile=$1
-  mkdir -p "$(dirname "$caddyfile")" "$CADDY_CONF_DIR"
-  [ -f "$caddyfile" ] || : > "$caddyfile"
-
-  import_line="import $CADDY_CONF_DIR/*.caddy"
-  if ! grep -Fxq "$import_line" "$caddyfile"; then
-    {
-      printf '\n'
-      printf '# GCMS installer: load site snippets managed under %s/\n' "$CADDY_CONF_DIR"
-      printf '%s\n' "$import_line"
-    } >> "$caddyfile"
-  fi
-}
-
-write_caddy_site() {
-  sitefile="$CADDY_CONF_DIR/gcms.caddy"
-  backend=$(caddy_backend)
-  tmp="${sitefile}.tmp.$$"
-  {
-    printf '# Managed by GCMS installer. Re-run install.sh with ENABLE_CADDY=1 to update.\n'
-    printf '%s {\n' "$SITE_DOMAIN"
-    printf '    encode gzip\n'
-    printf '    reverse_proxy %s\n' "$backend"
-    printf '}\n'
-  } > "$tmp"
-  mv "$tmp" "$sitefile"
-  chmod 0644 "$sitefile"
-  ok "已写入 Caddy 站点配置：$sitefile（反代到 $backend）"
-}
-
-reload_caddy() {
-  if command -v systemctl >/dev/null 2>&1 &&
-    [ -d /run/systemd/system ] &&
-    systemctl list-unit-files caddy.service --no-legend 2>/dev/null | grep -q '^caddy\.service'; then
-    systemctl enable --now caddy
-    systemctl reload caddy || systemctl restart caddy
-    return
-  fi
-
-  if caddy reload --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
-    return
-  fi
-  caddy start --config "$CADDYFILE" --adapter caddyfile
-}
-
 setup_caddy() {
   caddy_enabled || return 0
+  root=$1
+  setup_work=
 
-  install_caddy_if_needed
-
-  stamp=$(date '+%Y%m%d%H%M%S')
-  backup="$CADDYFILE.gcms-backup-$stamp"
-  original_exists=0
-  if [ -f "$CADDYFILE" ]; then
-    cp "$CADDYFILE" "$backup"
-    original_exists=1
+  if [ -f "$SCRIPT_DIR/install.sh" ] && [ -f "$SCRIPT_DIR/setup-caddy.sh" ]; then
+    setup_script="$SCRIPT_DIR/setup-caddy.sh"
+  else
+    setup_work=$(mktemp -d 2>/dev/null || mktemp -d -t gcms-setup-caddy)
+    setup_script="$setup_work/setup-caddy.sh"
+    download_file "$SETUP_CADDY_URL" "$setup_script" || fail "下载 setup-caddy.sh 失败"
   fi
 
-  ensure_caddy_import "$CADDYFILE"
-  write_caddy_site
-
-  info "校验 Caddy 配置"
-  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile; then
-    rm -f "$CADDY_CONF_DIR/gcms.caddy"
-    if [ "$original_exists" = "1" ]; then
-      cp "$backup" "$CADDYFILE"
-    else
-      rm -f "$CADDYFILE"
-    fi
-    fail "Caddy 配置校验失败，已回滚 /etc/caddy 配置。"
+  info "配置 Caddy 入口"
+  if ! GCMS_HOME="$root" \
+    DOMAIN="$SITE_DOMAIN" \
+    ADDR="${ADDR:-}" \
+    BASE_URL="${BASE_URL:-}" \
+    GCMS_RELEASE_REPO="$RELEASE_REPO" \
+    GCMS_SETUP_CADDY_URL="$SETUP_CADDY_URL" \
+    sh "$setup_script"; then
+    [ -z "$setup_work" ] || rm -rf "$setup_work"
+    fail "Caddy 入口配置失败"
   fi
-
-  info "重载 Caddy"
-  reload_caddy || fail "Caddy 重载失败。请检查 systemctl status caddy 或 Caddy 日志。"
-  ok "Caddy 已配置：https://$SITE_DOMAIN → $(caddy_backend)"
-  warn "请确认域名 $SITE_DOMAIN 已解析到这台服务器，并且防火墙放行 80/443。"
+  [ -z "$setup_work" ] || rm -rf "$setup_work"
 }
 
 base_url_hint() {
@@ -404,9 +306,13 @@ run_upgrade_if_standard() {
   else
     (cd "$root" && ./scripts/cms.sh upgrade)
   fi
-  setup_caddy
+  setup_caddy "$root"
   if [ "$START_AFTER_INSTALL" != "0" ]; then
-    (cd "$root" && ./scripts/cms.sh start)
+    if caddy_enabled; then
+      (cd "$root" && ./scripts/cms.sh restart)
+    else
+      (cd "$root" && ./scripts/cms.sh start)
+    fi
   fi
   print_done "$root"
 }
@@ -422,7 +328,7 @@ main() {
   platform=$(detect_platform)
   goos=${platform%/*}
   goarch=${platform#*/}
-  prepare_caddy_env "$goos"
+  prepare_caddy_defaults "$goos"
 
   if [ -d "$root" ] && is_standard_install "$root"; then
     run_upgrade_if_standard "$root"
@@ -479,7 +385,7 @@ main() {
   chmod +x "$root/scripts/cms.sh" 2>/dev/null || true
   chmod +x "$root/current/bin/cms" 2>/dev/null || true
   configure_install "$root"
-  setup_caddy
+  setup_caddy "$root"
 
   if [ "$START_AFTER_INSTALL" = "0" ]; then
     ok "已安装 GCMS $release_version（未自动启动）"

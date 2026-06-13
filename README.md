@@ -33,23 +33,34 @@ curl -fsSL https://raw.githubusercontent.com/ccvar/gcms-releases/main/install.sh
 
 ## 一键安装并配置 Caddy
 
-如果服务器已经有域名解析，并且希望自动配置 HTTPS 入口，可以显式开启 Caddy 模式：
+如果服务器已经有域名解析，并且希望自动配置 HTTPS 入口，可以分两步执行：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ccvar/gcms-releases/main/install.sh | env ENABLE_CADDY=1 DOMAIN=cms.example.com sh
+# 1. 只安装 Caddy
+curl -fsSL https://raw.githubusercontent.com/ccvar/gcms-releases/main/install-caddy.sh | sudo sh
+
+# 2. 把已安装的 GCMS 接入 Caddy
+curl -fsSL https://raw.githubusercontent.com/ccvar/gcms-releases/main/setup-caddy.sh | sudo env DOMAIN=cms.example.com GCMS_HOME=/opt/gcms sh
 ```
 
-如果当前不是 root 用户：
+也可以在安装 GCMS 时顺手配置 Caddy：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ccvar/gcms-releases/main/install.sh | sudo env ENABLE_CADDY=1 DOMAIN=cms.example.com sh
 ```
 
-Caddy 模式会：
+`setup-caddy.sh` 会自动检测：
+
+- `GCMS_HOME`，不传时依次尝试当前目录、`/opt/gcms`、`$HOME/gcms`
+- `shared/cms.conf` 中的 `ADDR` 和 `BASE_URL`
+- 未传 `DOMAIN` 时，会尝试从 `BASE_URL` 推断域名
+- 如果没有安全的本地监听地址，会把 GCMS 改成 `127.0.0.1:8080`
+
+这些脚本会：
 
 - 要求在 Linux root 用户下执行
-- 自动安装 Caddy（支持常见的 apt / dnf / pacman 系统；如果已安装则直接复用）
-- 默认让 GCMS 监听 `127.0.0.1:8080`
+- 按需安装 Caddy（支持常见的 apt / dnf / pacman 系统；如果已安装则直接复用）
+- 写入 `ADDR=127.0.0.1:8080` 或检测到的本地监听地址
 - 写入 `BASE_URL=https://你的域名`
 - 写入 `/etc/caddy/conf.d/gcms.caddy`
 - 在 `/etc/caddy/Caddyfile` 中追加 `import /etc/caddy/conf.d/*.caddy`
