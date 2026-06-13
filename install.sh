@@ -12,12 +12,18 @@
 #   GCMS_START=0                    Install only, do not start the service.
 #   ADDR=:8080                      Listen address written to shared/cms.conf.
 #   BASE_URL=https://example.com    Public site URL written to shared/cms.conf.
+#   ENABLE_CADDY=1 DOMAIN=example.com
+#                                    Install/configure Caddy on Linux and proxy HTTPS to GCMS.
 
 set -eu
 
 RELEASE_REPO=${GCMS_RELEASE_REPO:-ccvar/gcms-releases}
 VERSION=${GCMS_VERSION:-}
 START_AFTER_INSTALL=${GCMS_START:-1}
+ENABLE_CADDY=${ENABLE_CADDY:-${GCMS_ENABLE_CADDY:-0}}
+SITE_DOMAIN=${DOMAIN:-${GCMS_DOMAIN:-}}
+CADDYFILE=${GCMS_CADDYFILE:-/etc/caddy/Caddyfile}
+CADDY_CONF_DIR=${GCMS_CADDY_CONF_DIR:-/etc/caddy/conf.d}
 
 if [ -t 1 ]; then
   C_OK='\033[32m'
@@ -182,6 +188,177 @@ configure_install() {
   return 0
 }
 
+is_true() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+caddy_enabled() {
+  is_true "$ENABLE_CADDY"
+}
+
+prepare_caddy_env() {
+  goos=$1
+  caddy_enabled || return 0
+
+  [ "$goos" = "linux" ] || fail "Caddy 自动安装与系统服务配置暂只支持 Linux。其他系统请手动安装 Caddy 后配置反向代理。"
+  [ "$(id -u)" = "0" ] || fail "ENABLE_CADDY=1 需要 root 权限：脚本要安装 Caddy 并写入 /etc/caddy。"
+  [ -n "$SITE_DOMAIN" ] || fail "启用 Caddy 时需要传入 DOMAIN，例如：ENABLE_CADDY=1 DOMAIN=cms.example.com"
+
+  case "$SITE_DOMAIN" in
+    http://*|https://*|*/*|*' '*)
+      fail "DOMAIN 只填写域名，不要带 http(s)://、路径或空格，例如：DOMAIN=cms.example.com"
+      ;;
+    \**)
+      fail "一键 Caddy 模式暂不支持通配符域名。请手动配置 DNS-01 后再接入 Caddy。"
+      ;;
+  esac
+
+  if [ -z "${ADDR:-}" ]; then
+    ADDR=127.0.0.1:8080
+  fi
+  if [ -z "${BASE_URL:-}" ]; then
+    BASE_URL="https://$SITE_DOMAIN"
+  fi
+}
+
+caddy_backend() {
+  addr=${ADDR:-127.0.0.1:8080}
+  case "$addr" in
+    :*) printf '127.0.0.1%s' "$addr" ;;
+    0.0.0.0:*) printf '127.0.0.1:%s' "${addr##*:}" ;;
+    '[::]'*) printf '127.0.0.1:%s' "${addr##*:}" ;;
+    *) printf '%s' "$addr" ;;
+  esac
+}
+
+install_caddy_apt() {
+  info "安装 Caddy（Debian/Ubuntu 官方 apt 源）"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+  tmp_key="/tmp/caddy-stable-gpg.$$"
+  curl -1fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$tmp_key"
+  gpg --dearmor < "$tmp_key" > /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  rm -f "$tmp_key"
+  curl -1fsSL 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o /etc/apt/sources.list.d/caddy-stable.list
+  chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
+  apt-get update
+  apt-get install -y caddy
+}
+
+install_caddy_dnf() {
+  info "安装 Caddy（Fedora/RHEL/CentOS COPR）"
+  dnf -y install dnf5-plugins || dnf -y install dnf-plugins-core
+  dnf -y copr enable @caddy/caddy
+  dnf -y install caddy
+}
+
+install_caddy_pacman() {
+  info "安装 Caddy（Arch/Manjaro pacman）"
+  pacman -Sy --noconfirm caddy
+}
+
+install_caddy_if_needed() {
+  if command -v caddy >/dev/null 2>&1; then
+    ok "已检测到 Caddy：$(caddy version 2>/dev/null || printf 'installed')"
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    install_caddy_apt
+  elif command -v dnf >/dev/null 2>&1; then
+    install_caddy_dnf
+  elif command -v pacman >/dev/null 2>&1; then
+    install_caddy_pacman
+  else
+    fail "未找到支持的包管理器。请先手动安装 Caddy，再重新执行 ENABLE_CADDY=1 DOMAIN=$SITE_DOMAIN。"
+  fi
+
+  command -v caddy >/dev/null 2>&1 || fail "Caddy 安装后仍不可用，请检查系统包管理器输出。"
+}
+
+ensure_caddy_import() {
+  caddyfile=$1
+  mkdir -p "$(dirname "$caddyfile")" "$CADDY_CONF_DIR"
+  [ -f "$caddyfile" ] || : > "$caddyfile"
+
+  import_line="import $CADDY_CONF_DIR/*.caddy"
+  if ! grep -Fxq "$import_line" "$caddyfile"; then
+    {
+      printf '\n'
+      printf '# GCMS installer: load site snippets managed under %s/\n' "$CADDY_CONF_DIR"
+      printf '%s\n' "$import_line"
+    } >> "$caddyfile"
+  fi
+}
+
+write_caddy_site() {
+  sitefile="$CADDY_CONF_DIR/gcms.caddy"
+  backend=$(caddy_backend)
+  tmp="${sitefile}.tmp.$$"
+  {
+    printf '# Managed by GCMS installer. Re-run install.sh with ENABLE_CADDY=1 to update.\n'
+    printf '%s {\n' "$SITE_DOMAIN"
+    printf '    encode gzip\n'
+    printf '    reverse_proxy %s\n' "$backend"
+    printf '}\n'
+  } > "$tmp"
+  mv "$tmp" "$sitefile"
+  chmod 0644 "$sitefile"
+  ok "已写入 Caddy 站点配置：$sitefile（反代到 $backend）"
+}
+
+reload_caddy() {
+  if command -v systemctl >/dev/null 2>&1 &&
+    [ -d /run/systemd/system ] &&
+    systemctl list-unit-files caddy.service --no-legend 2>/dev/null | grep -q '^caddy\.service'; then
+    systemctl enable --now caddy
+    systemctl reload caddy || systemctl restart caddy
+    return
+  fi
+
+  if caddy reload --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+    return
+  fi
+  caddy start --config "$CADDYFILE" --adapter caddyfile
+}
+
+setup_caddy() {
+  caddy_enabled || return 0
+
+  install_caddy_if_needed
+
+  stamp=$(date '+%Y%m%d%H%M%S')
+  backup="$CADDYFILE.gcms-backup-$stamp"
+  original_exists=0
+  if [ -f "$CADDYFILE" ]; then
+    cp "$CADDYFILE" "$backup"
+    original_exists=1
+  fi
+
+  ensure_caddy_import "$CADDYFILE"
+  write_caddy_site
+
+  info "校验 Caddy 配置"
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile; then
+    rm -f "$CADDY_CONF_DIR/gcms.caddy"
+    if [ "$original_exists" = "1" ]; then
+      cp "$backup" "$CADDYFILE"
+    else
+      rm -f "$CADDYFILE"
+    fi
+    fail "Caddy 配置校验失败，已回滚 /etc/caddy 配置。"
+  fi
+
+  info "重载 Caddy"
+  reload_caddy || fail "Caddy 重载失败。请检查 systemctl status caddy 或 Caddy 日志。"
+  ok "Caddy 已配置：https://$SITE_DOMAIN → $(caddy_backend)"
+  warn "请确认域名 $SITE_DOMAIN 已解析到这台服务器，并且防火墙放行 80/443。"
+}
+
 base_url_hint() {
   if [ -n "${BASE_URL:-}" ]; then
     printf '%s' "$BASE_URL"
@@ -210,6 +387,9 @@ print_done() {
   printf '访问地址：\n'
   printf '  前台：%s\n' "$url"
   printf '  后台：%s/admin\n' "$url"
+  if caddy_enabled; then
+    printf '  Caddy：%s → %s\n' "$SITE_DOMAIN" "$(caddy_backend)"
+  fi
   printf '\n'
   warn '首次登录默认账号：admin / admin123，登录后请尽快修改密码。'
 }
@@ -218,11 +398,13 @@ run_upgrade_if_standard() {
   root=$1
   info "检测到已有标准 GCMS 目录，改为执行升级：$root"
   chmod +x "$root/scripts/cms.sh" 2>/dev/null || true
+  configure_install "$root"
   if [ -n "$VERSION" ]; then
     (cd "$root" && ./scripts/cms.sh upgrade "$VERSION")
   else
     (cd "$root" && ./scripts/cms.sh upgrade)
   fi
+  setup_caddy
   if [ "$START_AFTER_INSTALL" != "0" ]; then
     (cd "$root" && ./scripts/cms.sh start)
   fi
@@ -240,6 +422,7 @@ main() {
   platform=$(detect_platform)
   goos=${platform%/*}
   goarch=${platform#*/}
+  prepare_caddy_env "$goos"
 
   if [ -d "$root" ] && is_standard_install "$root"; then
     run_upgrade_if_standard "$root"
@@ -296,6 +479,7 @@ main() {
   chmod +x "$root/scripts/cms.sh" 2>/dev/null || true
   chmod +x "$root/current/bin/cms" 2>/dev/null || true
   configure_install "$root"
+  setup_caddy
 
   if [ "$START_AFTER_INSTALL" = "0" ]; then
     ok "已安装 GCMS $release_version（未自动启动）"
