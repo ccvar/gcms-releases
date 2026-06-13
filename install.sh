@@ -14,6 +14,7 @@
 #   BASE_URL=https://example.com    Public site URL written to shared/cms.conf.
 #   ENABLE_CADDY=1 DOMAIN=example.com
 #                                    Install/configure Caddy on Linux and proxy HTTPS to GCMS.
+#   WWW_REDIRECT=1                  Redirect www.<DOMAIN> to DOMAIN when Caddy is enabled.
 
 set -eu
 
@@ -22,6 +23,8 @@ VERSION=${GCMS_VERSION:-}
 START_AFTER_INSTALL=${GCMS_START:-1}
 ENABLE_CADDY=${ENABLE_CADDY:-${GCMS_ENABLE_CADDY:-0}}
 SITE_DOMAIN=${DOMAIN:-${GCMS_DOMAIN:-}}
+WWW_REDIRECT=${WWW_REDIRECT:-${GCMS_WWW_REDIRECT:-0}}
+WWW_DOMAIN=${WWW_DOMAIN:-${GCMS_WWW_DOMAIN:-}}
 SETUP_CADDY_URL=${GCMS_SETUP_CADDY_URL:-https://raw.githubusercontent.com/$RELEASE_REPO/main/setup-caddy.sh}
 SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || pwd)
 
@@ -250,6 +253,8 @@ setup_caddy() {
   info "配置 Caddy 入口"
   if ! GCMS_HOME="$root" \
     DOMAIN="$SITE_DOMAIN" \
+    WWW_REDIRECT="$WWW_REDIRECT" \
+    WWW_DOMAIN="$WWW_DOMAIN" \
     ADDR="${ADDR:-}" \
     BASE_URL="${BASE_URL:-}" \
     GCMS_RELEASE_REPO="$RELEASE_REPO" \

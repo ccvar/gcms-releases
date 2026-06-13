@@ -2,7 +2,7 @@
 # Configure Caddy as the public HTTPS entry for an installed GCMS directory.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/ccvar/gcms-releases/main/setup-caddy.sh | sudo env DOMAIN=cms.example.com GCMS_HOME=/opt/gcms sh
+#   curl -fsSL https://raw.githubusercontent.com/ccvar/gcms-releases/main/setup-caddy.sh | sudo env DOMAIN=example.com WWW_REDIRECT=1 GCMS_HOME=/opt/gcms sh
 
 set -eu
 
@@ -12,6 +12,8 @@ CADDYFILE=${GCMS_CADDYFILE:-/etc/caddy/Caddyfile}
 CADDY_CONF_DIR=${GCMS_CADDY_CONF_DIR:-/etc/caddy/conf.d}
 CADDY_SITE_FILE=${GCMS_CADDY_SITE_FILE:-$CADDY_CONF_DIR/gcms.caddy}
 SITE_DOMAIN=${DOMAIN:-${GCMS_DOMAIN:-}}
+WWW_REDIRECT=${WWW_REDIRECT:-${GCMS_WWW_REDIRECT:-0}}
+WWW_DOMAIN=${WWW_DOMAIN:-${GCMS_WWW_DOMAIN:-}}
 SKIP_CADDY_INSTALL=${GCMS_SKIP_CADDY_INSTALL:-0}
 
 if [ -t 1 ]; then
@@ -141,13 +143,26 @@ validate_domain() {
   domain=$1
   [ -n "$domain" ] || fail "需要传入 DOMAIN，例如：DOMAIN=cms.example.com"
   case "$domain" in
-    http://*|https://*|*/*|*' '*)
+    http://*|https://*|*/*|*' '*|*,*)
       fail "DOMAIN 只填写域名，不要带 http(s)://、路径或空格，例如：DOMAIN=cms.example.com"
       ;;
     \**)
       fail "一键 Caddy 配置暂不支持通配符域名。请手动配置 DNS-01 后再接入 Caddy。"
       ;;
   esac
+}
+
+www_redirect_enabled() {
+  is_true "$WWW_REDIRECT"
+}
+
+www_domain_for() {
+  domain=$1
+  if [ -n "$WWW_DOMAIN" ]; then
+    printf '%s' "$WWW_DOMAIN"
+    return
+  fi
+  printf 'www.%s' "$domain"
 }
 
 normalize_backend_addr() {
@@ -197,18 +212,35 @@ ensure_caddy_import() {
 write_caddy_site() {
   domain=$1
   backend=$2
+  redirect_domain=
+  if www_redirect_enabled; then
+    redirect_domain=$(www_domain_for "$domain")
+  fi
   tmp="${CADDY_SITE_FILE}.tmp.$$"
   mkdir -p "$(dirname "$CADDY_SITE_FILE")"
   {
     printf '# Managed by GCMS setup-caddy.sh. Re-run the script to update.\n'
+    if [ -n "$redirect_domain" ]; then
+      printf '%s {\n' "$redirect_domain"
+      printf '    redir https://%s{uri} permanent\n' "$domain"
+      printf '}\n'
+      printf '\n'
+    fi
     printf '%s {\n' "$domain"
-    printf '    encode gzip\n'
+    printf '    encode zstd gzip\n'
+    printf '    header /assets/* Cache-Control "public, max-age=31536000, immutable"\n'
+    printf '    header /uploads/* Cache-Control "public, max-age=2592000"\n'
+    printf '\n'
     printf '    reverse_proxy %s\n' "$backend"
     printf '}\n'
   } > "$tmp"
   mv "$tmp" "$CADDY_SITE_FILE"
   chmod 0644 "$CADDY_SITE_FILE"
-  ok "已写入 Caddy 站点配置：$CADDY_SITE_FILE（反代到 $backend）"
+  if [ -n "$redirect_domain" ]; then
+    ok "已写入 Caddy 站点配置：$CADDY_SITE_FILE（$redirect_domain 跳转到 $domain，反代到 $backend）"
+  else
+    ok "已写入 Caddy 站点配置：$CADDY_SITE_FILE（反代到 $backend）"
+  fi
 }
 
 reload_caddy() {
@@ -240,6 +272,14 @@ main() {
     SITE_DOMAIN=$(domain_from_base_url "$base_url")
   fi
   validate_domain "$SITE_DOMAIN"
+  if www_redirect_enabled; then
+    case "$SITE_DOMAIN" in
+      www.*) fail "启用 WWW_REDIRECT=1 时，DOMAIN 应填写主域，例如 example.com，而不是 $SITE_DOMAIN" ;;
+    esac
+    redirect_domain=$(www_domain_for "$SITE_DOMAIN")
+    validate_domain "$redirect_domain"
+    [ "$redirect_domain" != "$SITE_DOMAIN" ] || fail "WWW 跳转域不能与主域相同"
+  fi
 
   backend=$(normalize_backend_addr "${ADDR:-$(conf_value "$conf" ADDR)}")
   site_url=${BASE_URL:-https://$SITE_DOMAIN}
@@ -286,7 +326,13 @@ main() {
   info "重载 Caddy"
   reload_caddy || fail "Caddy 重载失败。请检查 systemctl status caddy 或 Caddy 日志。"
   ok "Caddy 已配置：https://$SITE_DOMAIN → $backend"
-  warn "请确认域名 $SITE_DOMAIN 已解析到这台服务器，并且防火墙放行 80/443。"
+  if www_redirect_enabled; then
+    redirect_domain=$(www_domain_for "$SITE_DOMAIN")
+    ok "WWW 跳转已配置：https://$redirect_domain → https://$SITE_DOMAIN"
+    warn "请确认域名 $SITE_DOMAIN 和 $redirect_domain 都已解析到这台服务器，并且防火墙放行 80/443。"
+  else
+    warn "请确认域名 $SITE_DOMAIN 已解析到这台服务器，并且防火墙放行 80/443。"
+  fi
 }
 
 main "$@"
